@@ -4,8 +4,9 @@ Engagement Letter — DOCX template -> data injection -> high-fidelity PDF.
 Usage:
     uv run generate.py                         # uses data.json
     uv run generate.py --data other.json       # different data file
+    uv run generate.py --renderer pages        # Apple Pages via AppleScript (macOS, default)
     uv run generate.py --renderer word         # Word via docx2pdf (macOS/Windows)
-    uv run generate.py --renderer libreoffice  # LibreOffice headless (default)
+    uv run generate.py --renderer libreoffice  # LibreOffice headless
 
 Output (in ./output/):
     - engagement_letter_filled.docx
@@ -49,6 +50,45 @@ def render_with_word(filled_docx: Path, output_dir: Path) -> Path:
     log.info("Rendering with Word (docx2pdf)...")
     convert(str(filled_docx), str(out_pdf))
     log.info("[2/2] PDF (Word) -> %s", out_pdf.name)
+    return out_pdf
+
+
+def render_with_pages(filled_docx: Path, output_dir: Path) -> Path:
+    """
+    Render via Apple Pages (AppleScript), macOS only.
+
+    LibreOffice's layout engine computes paragraph spacing, table cell
+    padding and line-height differently from Word/Pages, so even byte-
+    identical DOCX XML produces different pagination between engines.
+    Pages is the app used to view/compare the original document, so
+    rendering through it (rather than LibreOffice) gives a 1:1 match by
+    construction instead of chasing per-element spacing patches.
+    """
+    out_pdf = output_dir / "engagement_letter_filled.pdf"
+    docx_path = str(filled_docx.resolve())
+    pdf_path = str(out_pdf.resolve())
+    log.info("Rendering with Pages (AppleScript)...")
+    script = f'''
+    tell application "Pages"
+        repeat with d in documents
+            try
+                if POSIX path of (file of d) is "{docx_path}" then
+                    close d saving no
+                end if
+            end try
+        end repeat
+        set theDoc to open POSIX file "{docx_path}"
+        export theDoc to POSIX file "{pdf_path}" as PDF
+        close theDoc saving no
+    end tell
+    '''
+    result = subprocess.run(
+        ["osascript", "-e", script], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        log.error("Pages export failed:\n%s", result.stderr.strip())
+        sys.exit(1)
+    log.info("[2/2] PDF (Pages) -> %s", out_pdf.name)
     return out_pdf
 
 
@@ -157,8 +197,8 @@ def main() -> None:
     parser.add_argument("--data", default="data.json")
     parser.add_argument(
         "--renderer",
-        choices=["word", "libreoffice"],
-        default="libreoffice",
+        choices=["pages", "word", "libreoffice"],
+        default="pages",
     )
     args = parser.parse_args()
 
@@ -206,8 +246,10 @@ def main() -> None:
 
     if args.renderer == "word":
         render_with_word(filled_docx, OUTPUT_DIR)
-    else:
+    elif args.renderer == "libreoffice":
         render_with_libreoffice(filled_docx, OUTPUT_DIR)
+    else:
+        render_with_pages(filled_docx, OUTPUT_DIR)
 
     log.info("Done: %s", OUTPUT_DIR / "engagement_letter_filled.pdf")
 
