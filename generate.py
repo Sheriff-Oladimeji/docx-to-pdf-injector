@@ -1,9 +1,11 @@
 """
-Engagement Letter POC — DOCX template -> data injection -> high-fidelity PDF.
+Engagement Letter — DOCX template -> data injection -> high-fidelity PDF.
 
 Usage:
-    uv run generate.py                      # uses data.json
-    uv run generate.py --data other.json    # use a different data file
+    uv run generate.py                         # uses data.json
+    uv run generate.py --data other.json       # different data file
+    uv run generate.py --renderer word         # Word via docx2pdf (macOS/Windows)
+    uv run generate.py --renderer libreoffice  # LibreOffice headless (default)
 
 Output (in ./output/):
     - engagement_letter_filled.docx
@@ -29,35 +31,72 @@ ROOT = Path(__file__).parent
 TEMPLATE = ROOT / "templates" / "engagement_letter_template.docx"
 OUTPUT_DIR = ROOT / "output"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-5s  %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-5s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("poc")
 
 
-def find_soffice() -> str:
-    for c in ["soffice", "libreoffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice"]:
-        if shutil.which(c) or Path(c).exists():
-            log.info("LibreOffice: %s", c)
-            return c
-    sys.exit("LibreOffice not found.\n  macOS: brew install --cask libreoffice\n  Linux: sudo apt install libreoffice")
+def render_with_word(filled_docx: Path, output_dir: Path) -> Path:
+    try:
+        from docx2pdf import convert
+    except ImportError:
+        log.error("docx2pdf not installed. Run: uv add docx2pdf")
+        sys.exit(1)
+    out_pdf = output_dir / "engagement_letter_filled.pdf"
+    log.info("Rendering with Word (docx2pdf)...")
+    convert(str(filled_docx), str(out_pdf))
+    log.info("[2/2] PDF (Word) -> %s", out_pdf.name)
+    return out_pdf
+
+
+def render_with_libreoffice(filled_docx: Path, output_dir: Path) -> Path:
+    candidates = [
+        "soffice",
+        "libreoffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ]
+    soffice = next((c for c in candidates if shutil.which(c) or Path(c).exists()), None)
+    if not soffice:
+        sys.exit("LibreOffice not found.\n  macOS: brew install --cask libreoffice")
+    log.info("Rendering with LibreOffice: %s", soffice)
+    result = subprocess.run(
+        [
+            soffice,
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(output_dir),
+            str(filled_docx),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        log.error("LibreOffice failed:\n%s", result.stderr.strip())
+        sys.exit(1)
+    log.info("[2/2] PDF (LibreOffice) -> engagement_letter_filled.pdf")
+    return output_dir / "engagement_letter_filled.pdf"
 
 
 def patch_docx(docx_bytes: bytes) -> bytes:
     """
-    Three patches applied to raw DOCX bytes before rendering:
+    Two targeted patches applied to raw DOCX bytes before rendering.
+    Verified directly against the original untagged source file (not a
+    re-rendered copy) — the title underline gap at the DEFAULT value (80)
+    already matches the original exactly (33.7pt). No Heading1 patch needed.
 
-    1. Theme font resolution — replaces majorHAnsi/minorHAnsi with explicit font
-       names read from the document theme (e.g. Aptos Display / Aptos).
-       LibreOffice doesn't resolve theme font refs, so without this headings
-       render in the wrong weight.
+    1. Theme font resolution — replaces majorHAnsi/minorHAnsi with explicit
+       font names from the document theme (Aptos Display / Aptos).
+       Without this LibreOffice renders headings in the wrong weight.
 
-    2. docDefault line spacing — marks the default paragraph spacing as explicit
-       so LibreOffice honours it instead of falling back to single spacing.
-
-    3. Empty paragraph height — empty paragraphs act as blank lines in Word.
-       LibreOffice sometimes collapses them. This ensures they carry the same
-       line height as the rest of the document.
+    2. docDefault afterLines=0 — makes the docDefault line spacing explicit
+       so LibreOffice honours it instead of adding extra contextual space.
     """
-    # --- 1. Read theme font names ---
+    # Read theme fonts
     major_font, minor_font = "Aptos Display", "Aptos"
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
         if "word/theme/theme1.xml" in z.namelist():
@@ -65,75 +104,45 @@ def patch_docx(docx_bytes: bytes) -> bytes:
             ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
             mj = tree.find(".//a:fontScheme/a:majorFont/a:latin", ns)
             mn = tree.find(".//a:fontScheme/a:minorFont/a:latin", ns)
-            if mj is not None and mj.get("typeface"): major_font = mj.get("typeface")
-            if mn is not None and mn.get("typeface"): minor_font = mn.get("typeface")
+            if mj is not None and mj.get("typeface"):
+                major_font = mj.get("typeface")
+            if mn is not None and mn.get("typeface"):
+                minor_font = mn.get("typeface")
     log.info("Theme fonts: major=%s  minor=%s", major_font, minor_font)
 
-    def fix_empty_paras(s: str) -> str:
-        """Add explicit line height to empty paragraphs so LibreOffice doesn't collapse them."""
-        count = [0]
-        def _fix(m):
-            block = m.group(0)
-            if "<w:t" in block or "w:line=" in block:
-                return block
-            if "<w:pPr>" in block:
-                block = block.replace("<w:pPr>", '<w:pPr><w:spacing w:line="278" w:lineRule="auto"/>', 1)
-            elif re.search(r"<w:pPr\s", block):
-                block = re.sub(r"(<w:pPr[^>]*>)", r'\1<w:spacing w:line="278" w:lineRule="auto"/>', block, count=1)
-            else:
-                block = re.sub(r"(<w:p(?:\s[^>]*)?>)", r'\1<w:pPr><w:spacing w:line="278" w:lineRule="auto"/></w:pPr>', block, count=1)
-            count[0] += 1
-            return block
-        result = re.sub(r"<w:p[ >].*?</w:p>", _fix, s, flags=re.DOTALL)
-        log.info("Empty paragraph fix: %d paragraphs updated", count[0])
-        return result
-
     buf = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zin, \
-         zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+    with (
+        zipfile.ZipFile(io.BytesIO(docx_bytes)) as zin,
+        zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout,
+    ):
         for item in zin.infolist():
             data = zin.read(item.filename)
-
             if item.filename.endswith(".xml"):
                 s = data.decode("utf-8")
-
                 # Patch 1: theme font resolution
                 if item.filename in ("word/styles.xml", "word/document.xml"):
-                    s = re.sub(r'w:asciiTheme="majorHAnsi"', f'w:ascii="{major_font}"', s)
-                    s = re.sub(r'w:hAnsiTheme="majorHAnsi"',  f'w:hAnsi="{major_font}"', s)
-                    s = re.sub(r'w:asciiTheme="minorHAnsi"', f'w:ascii="{minor_font}"', s)
-                    s = re.sub(r'w:hAnsiTheme="minorHAnsi"',  f'w:hAnsi="{minor_font}"', s)
-
-                # Patch 2: docDefault line spacing
+                    s = re.sub(
+                        r'w:asciiTheme="majorHAnsi"', f'w:ascii="{major_font}"', s
+                    )
+                    s = re.sub(
+                        r'w:hAnsiTheme="majorHAnsi"', f'w:hAnsi="{major_font}"', s
+                    )
+                    s = re.sub(
+                        r'w:asciiTheme="minorHAnsi"', f'w:ascii="{minor_font}"', s
+                    )
+                    s = re.sub(
+                        r'w:hAnsiTheme="minorHAnsi"', f'w:hAnsi="{minor_font}"', s
+                    )
+                # Patch 2: docDefault line spacing explicit
                 if item.filename == "word/styles.xml":
                     s = re.sub(
                         r'(w:after="\d+" w:line="\d+" w:lineRule="auto")(?! w:afterLines)',
-                        r'\1 w:afterLines="0"', s, count=1
+                        r'\1 w:afterLines="0"',
+                        s,
+                        count=1,
                     )
-
-                # Patch 3: empty paragraph height
-                if item.filename == "word/document.xml":
-                    s = fix_empty_paras(s)
-
-                # Patch 4: table cell margins — Word's TableGrid style has vertical
-                # cell padding that LibreOffice doesn't apply, making rows too short.
-                # Inject explicit tblCellMar so both render rows at the same height.
-                if item.filename == "word/document.xml" and "<w:tblCellMar>" not in s:
-                    cellmar = (
-                        '<w:tblCellMar>'
-                        '<w:top w:w="55" w:type="dxa"/>'
-                        '<w:left w:w="108" w:type="dxa"/>'
-                        '<w:bottom w:w="55" w:type="dxa"/>'
-                        '<w:right w:w="108" w:type="dxa"/>'
-                        '</w:tblCellMar>'
-                    )
-                    s = s.replace("</w:tblPr>", cellmar + "</w:tblPr>")
-                    log.info("Table cell margins applied")
-
                 data = s.encode("utf-8")
-
             zout.writestr(item, data)
-
     return buf.getvalue()
 
 
@@ -146,11 +155,17 @@ def build_context(data: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data.json")
+    parser.add_argument(
+        "--renderer",
+        choices=["word", "libreoffice"],
+        default="libreoffice",
+    )
     args = parser.parse_args()
-    OUTPUT_DIR.mkdir(exist_ok=True)
 
-    log.info("Template : %s", TEMPLATE)
-    log.info("Data file: %s", ROOT / args.data)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    log.info("Template  : %s", TEMPLATE)
+    log.info("Data file : %s", ROOT / args.data)
+    log.info("Renderer  : %s", args.renderer)
 
     if not TEMPLATE.exists():
         sys.exit(f"ERROR: template not found at {TEMPLATE}")
@@ -166,7 +181,7 @@ def main() -> None:
     log.info("Merge tags: %s", tags or "NONE")
 
     if not tags:
-        log.error("Template has NO {{ }} merge fields — wrong file in templates/")
+        log.error("Template has NO {{ }} merge fields — check templates/")
         sys.exit(1)
 
     ctx = build_context(data)
@@ -189,16 +204,11 @@ def main() -> None:
     else:
         log.error("VERIFY FAILED: '%s' not found", data["client_name"])
 
-    soffice = find_soffice()
-    result = subprocess.run(
-        [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(OUTPUT_DIR), str(filled_docx)],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log.error("LibreOffice failed:\n%s", result.stderr.strip())
-        sys.exit(1)
+    if args.renderer == "word":
+        render_with_word(filled_docx, OUTPUT_DIR)
+    else:
+        render_with_libreoffice(filled_docx, OUTPUT_DIR)
 
-    log.info("[2/2] PDF -> engagement_letter_filled.pdf")
     log.info("Done: %s", OUTPUT_DIR / "engagement_letter_filled.pdf")
 
 
