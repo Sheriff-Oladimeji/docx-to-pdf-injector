@@ -5,6 +5,7 @@ Usage:
     uv run generate.py                         # uses data.json
     uv run generate.py --data other.json       # different data file
     uv run generate.py --renderer pages        # Apple Pages via AppleScript (macOS, default)
+    uv run generate.py --renderer weasyprint   # headless HTML/CSS rebuild (Linux-friendly, WIP fidelity)
     uv run generate.py --renderer word         # Word via docx2pdf (macOS/Windows)
     uv run generate.py --renderer libreoffice  # LibreOffice headless
 
@@ -27,6 +28,9 @@ from pathlib import Path
 
 from docx import Document
 from docxtpl import DocxTemplate
+from jinja2 import Environment
+
+import docx_html
 
 ROOT = Path(__file__).parent
 TEMPLATE = ROOT / "templates" / "engagement_letter_template.docx"
@@ -50,6 +54,53 @@ def render_with_word(filled_docx: Path, output_dir: Path) -> Path:
     log.info("Rendering with Word (docx2pdf)...")
     convert(str(filled_docx), str(out_pdf))
     log.info("[2/2] PDF (Word) -> %s", out_pdf.name)
+    return out_pdf
+
+
+def render_with_weasyprint(ctx: dict, output_dir: Path) -> Path:
+    """
+    Render via a from-scratch HTML/CSS rebuild of the letter (docx_html.py),
+    rendered to PDF by WeasyPrint.
+
+    Headless and Linux-friendly (no Word/Pages/LibreOffice needed), which
+    Pages-via-AppleScript is not -- this is the renderer to use once this
+    POC becomes a real hosted service. Content (text, bold runs, numbering,
+    the pricing table) is walked directly out of the template's DOCX XML,
+    never retyped, so legal wording can't drift. Layout is a hand-authored
+    CSS approximation of the original's fonts/margins/spacing, tuned
+    against Pages-rendered reference pages -- currently very close on page 1
+    and drifts to roughly +1 page over the full ~10-page document, so it is
+    not yet at the same fidelity as the `pages` renderer.
+    """
+    out_pdf = output_dir / "engagement_letter_filled.pdf"
+    log.info("Rendering with WeasyPrint (headless HTML/CSS rebuild)...")
+
+    # On macOS, WeasyPrint's native deps (Pango/Cairo/GObject, installed via
+    # `brew install pango`) live under the Homebrew prefix, which isn't on
+    # the dynamic linker's default search path -- without this, import
+    # fails with a "cannot load library 'libgobject-2.0-0'" OSError.
+    if sys.platform == "darwin":
+        import os
+
+        brew_lib = "/opt/homebrew/lib"
+        if Path(brew_lib).is_dir():
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = (
+                brew_lib + ":" + os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+            )
+
+    try:
+        from weasyprint import HTML
+    except OSError:
+        sys.exit(
+            "ERROR: WeasyPrint's native libraries aren't installed.\n"
+            "  macOS: brew install pango\n"
+            "  Linux: install libpango-1.0-0, libpangocairo-1.0-0, libgdk-pixbuf2.0-0"
+        )
+
+    page_html = docx_html.build_page_html(TEMPLATE)
+    rendered_html = Environment().from_string(page_html).render(**ctx)
+    HTML(string=rendered_html).write_pdf(str(out_pdf))
+    log.info("[2/2] PDF (WeasyPrint) -> %s", out_pdf.name)
     return out_pdf
 
 
@@ -197,7 +248,7 @@ def main() -> None:
     parser.add_argument("--data", default="data.json")
     parser.add_argument(
         "--renderer",
-        choices=["pages", "word", "libreoffice"],
+        choices=["pages", "weasyprint", "word", "libreoffice"],
         default="pages",
     )
     args = parser.parse_args()
@@ -248,6 +299,8 @@ def main() -> None:
         render_with_word(filled_docx, OUTPUT_DIR)
     elif args.renderer == "libreoffice":
         render_with_libreoffice(filled_docx, OUTPUT_DIR)
+    elif args.renderer == "weasyprint":
+        render_with_weasyprint(ctx, OUTPUT_DIR)
     else:
         render_with_pages(filled_docx, OUTPUT_DIR)
 
