@@ -1,13 +1,36 @@
 """
 Engagement Letter — DOCX template -> data injection -> high-fidelity PDF.
 
+WHAT THIS SCRIPT DOES
+    1. Takes templates/engagement_letter_template.docx (a real Word letter
+       with {{ tag }} merge fields dropped into it) and a JSON file of client
+       data.
+    2. Fills the tags in with docxtpl, producing a real, editable .docx.
+    3. Converts that .docx to a PDF that visually matches the original
+       document -- same fonts, spacing, and page breaks -- by rendering
+       through a real Word-family app (Apple Pages) rather than an
+       approximation. See render_with_pages() for why.
+
+WHY PAGES AND NOT A "NORMAL" PDF LIBRARY
+    The client compares our output against the original document opened in
+    a real Word-family app. Two different rendering engines (e.g.
+    LibreOffice vs. Pages/Word) compute paragraph spacing and line-height
+    differently even given byte-identical DOCX XML -- measured directly,
+    not assumed -- so the only way to guarantee a pixel match is to use the
+    same kind of engine the comparison is being made against. That's why
+    `pages` is the default renderer, and why `libreoffice` is kept only as
+    a lower-fidelity fallback for when Pages isn't available.
+
+    Caveat: `pages` only runs on macOS with Pages installed and a real
+    logged-in desktop session (it's driving a GUI app, not headless) -- see
+    render_with_pages()'s docstring for the full limitation list.
+
 Usage:
     uv run generate.py                         # uses data.json
     uv run generate.py --data other.json       # different data file
     uv run generate.py --renderer pages        # Apple Pages via AppleScript (macOS, default)
-    uv run generate.py --renderer weasyprint   # headless HTML/CSS rebuild (Linux-friendly, WIP fidelity)
     uv run generate.py --renderer word         # Word via docx2pdf (macOS/Windows)
-    uv run generate.py --renderer libreoffice  # LibreOffice headless
+    uv run generate.py --renderer libreoffice  # LibreOffice headless (lower fidelity, see above)
 
 Output (in ./output/):
     - engagement_letter_filled.docx
@@ -28,12 +51,10 @@ from pathlib import Path
 
 from docx import Document
 from docxtpl import DocxTemplate
-from jinja2 import Environment
-
-import docx_html
 
 ROOT = Path(__file__).parent
 TEMPLATE = ROOT / "templates" / "engagement_letter_template.docx"
+FONTS_DIR = ROOT / "templates" / "fonts"
 OUTPUT_DIR = ROOT / "output"
 
 logging.basicConfig(
@@ -44,76 +65,57 @@ logging.basicConfig(
 log = logging.getLogger("poc")
 
 
-def render_with_word(filled_docx: Path, output_dir: Path) -> Path:
-    try:
-        from docx2pdf import convert
-    except ImportError:
-        log.error("docx2pdf not installed. Run: uv add docx2pdf")
-        sys.exit(1)
-    out_pdf = output_dir / "engagement_letter_filled.pdf"
-    log.info("Rendering with Word (docx2pdf)...")
-    convert(str(filled_docx), str(out_pdf))
-    log.info("[2/2] PDF (Word) -> %s", out_pdf.name)
-    return out_pdf
-
-
-def render_with_weasyprint(ctx: dict, output_dir: Path) -> Path:
+def ensure_fonts_installed() -> None:
     """
-    Render via a from-scratch HTML/CSS rebuild of the letter (docx_html.py),
-    rendered to PDF by WeasyPrint.
+    Pages (and Word) render the letter in Aptos, the font the original
+    document is authored in. Aptos doesn't ship with macOS, so a machine
+    that's never opened an Aptos-using Word doc won't have it -- Pages
+    would silently substitute a different font and the pixel-match this
+    whole pipeline depends on would break with no error raised. Bundling
+    the .ttf files here and auto-installing them means any Mac this runs
+    on self-heals instead of quietly producing the wrong output.
 
-    Headless and Linux-friendly (no Word/Pages/LibreOffice needed), which
-    Pages-via-AppleScript is not -- this is the renderer to use once this
-    POC becomes a real hosted service. Content (text, bold runs, numbering,
-    the pricing table) is walked directly out of the template's DOCX XML,
-    never retyped, so legal wording can't drift. Layout is a hand-authored
-    CSS approximation of the original's fonts/margins/spacing, tuned
-    against Pages-rendered reference pages -- currently very close on page 1
-    and drifts to roughly +1 page over the full ~10-page document, so it is
-    not yet at the same fidelity as the `pages` renderer.
+    Note: Aptos is a Microsoft font. Bundling the .ttf files in this repo
+    is a POC convenience, not confirmed-cleared redistribution -- get
+    proper licensing sorted before this becomes a public/commercial repo.
     """
-    out_pdf = output_dir / "engagement_letter_filled.pdf"
-    log.info("Rendering with WeasyPrint (headless HTML/CSS rebuild)...")
+    if sys.platform != "darwin":
+        return
+    user_fonts_dir = Path.home() / "Library" / "Fonts"
+    if (user_fonts_dir / "aptos.ttf").exists():
+        return
+    font_files = sorted(FONTS_DIR.glob("*.ttf"))
+    if not font_files:
+        log.warning("No bundled fonts found in %s -- skipping install", FONTS_DIR)
+        return
+    log.info("Aptos not found on this Mac -- installing from templates/fonts/")
+    user_fonts_dir.mkdir(parents=True, exist_ok=True)
+    for font_file in font_files:
+        shutil.copy(font_file, user_fonts_dir / font_file.name)
+    log.info("Installed %d font file(s) to %s", len(font_files), user_fonts_dir)
 
-    # On macOS, WeasyPrint's native deps (Pango/Cairo/GObject, installed via
-    # `brew install pango`) live under the Homebrew prefix, which isn't on
-    # the dynamic linker's default search path -- without this, import
-    # fails with a "cannot load library 'libgobject-2.0-0'" OSError.
-    if sys.platform == "darwin":
-        import os
 
-        brew_lib = "/opt/homebrew/lib"
-        if Path(brew_lib).is_dir():
-            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = (
-                brew_lib + ":" + os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
-            )
-
-    try:
-        from weasyprint import HTML
-    except OSError:
-        sys.exit(
-            "ERROR: WeasyPrint's native libraries aren't installed.\n"
-            "  macOS: brew install pango\n"
-            "  Linux: install libpango-1.0-0, libpangocairo-1.0-0, libgdk-pixbuf2.0-0"
-        )
-
-    page_html = docx_html.build_page_html(TEMPLATE)
-    rendered_html = Environment().from_string(page_html).render(**ctx)
-    HTML(string=rendered_html).write_pdf(str(out_pdf))
-    log.info("[2/2] PDF (WeasyPrint) -> %s", out_pdf.name)
-    return out_pdf
+# --------------------------------------------------------------------------
+# Renderers -- each takes the already-filled .docx and produces the PDF.
+# --------------------------------------------------------------------------
 
 
 def render_with_pages(filled_docx: Path, output_dir: Path) -> Path:
     """
-    Render via Apple Pages (AppleScript), macOS only.
+    Render via Apple Pages (AppleScript). This is the default renderer and
+    the one proven (by direct pixel measurement) to match the original
+    document's layout exactly.
 
-    LibreOffice's layout engine computes paragraph spacing, table cell
-    padding and line-height differently from Word/Pages, so even byte-
-    identical DOCX XML produces different pagination between engines.
-    Pages is the app used to view/compare the original document, so
-    rendering through it (rather than LibreOffice) gives a 1:1 match by
-    construction instead of chasing per-element spacing patches.
+    Limitations, so they're not a surprise later:
+      - macOS + Pages only, no Linux/Windows/cloud-container equivalent.
+      - Not headless -- drives a real GUI app, needs an actual logged-in
+        desktop session (won't work over plain SSH or in a typical Docker
+        container).
+      - One document at a time; not built for concurrent/batch generation.
+      - Needs a one-time OS permission grant (System Settings > Privacy &
+        Security > Automation) the first time something scripts Pages.
+      - Fragile to future macOS/Pages updates changing what AppleScript can
+        do to the app.
     """
     out_pdf = output_dir / "engagement_letter_filled.pdf"
     docx_path = str(filled_docx.resolve())
@@ -143,7 +145,29 @@ def render_with_pages(filled_docx: Path, output_dir: Path) -> Path:
     return out_pdf
 
 
+def render_with_word(filled_docx: Path, output_dir: Path) -> Path:
+    """Render via Microsoft Word (docx2pdf), macOS/Windows only."""
+    try:
+        from docx2pdf import convert
+    except ImportError:
+        log.error("docx2pdf not installed. Run: uv add docx2pdf")
+        sys.exit(1)
+    out_pdf = output_dir / "engagement_letter_filled.pdf"
+    log.info("Rendering with Word (docx2pdf)...")
+    convert(str(filled_docx), str(out_pdf))
+    log.info("[2/2] PDF (Word) -> %s", out_pdf.name)
+    return out_pdf
+
+
 def render_with_libreoffice(filled_docx: Path, output_dir: Path) -> Path:
+    """
+    Render via headless LibreOffice. Headless and cross-platform, but
+    verified (by direct pixel measurement, not assumption) to compute
+    paragraph line-height differently than Word/Pages for the same font --
+    the layout drifts further from the original the deeper into the
+    document you go. Kept only as a fallback for environments without
+    Pages/Word; expect a looser visual match than those renderers.
+    """
     candidates = [
         "soffice",
         "libreoffice",
@@ -173,13 +197,17 @@ def render_with_libreoffice(filled_docx: Path, output_dir: Path) -> Path:
     return output_dir / "engagement_letter_filled.pdf"
 
 
+# --------------------------------------------------------------------------
+# DOCX patching -- fixes applied to the raw template bytes before any
+# renderer sees them. Both patches only matter for the LibreOffice path
+# (Pages/Word resolve theme fonts and line spacing correctly on their own);
+# they're harmless no-ops for the other renderers, so left in unconditionally
+# rather than special-cased per renderer.
+# --------------------------------------------------------------------------
+
+
 def patch_docx(docx_bytes: bytes) -> bytes:
     """
-    Two targeted patches applied to raw DOCX bytes before rendering.
-    Verified directly against the original untagged source file (not a
-    re-rendered copy) — the title underline gap at the DEFAULT value (80)
-    already matches the original exactly (33.7pt). No Heading1 patch needed.
-
     1. Theme font resolution — replaces majorHAnsi/minorHAnsi with explicit
        font names from the document theme (Aptos Display / Aptos).
        Without this LibreOffice renders headings in the wrong weight.
@@ -237,10 +265,22 @@ def patch_docx(docx_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+# --------------------------------------------------------------------------
+# Data injection
+# --------------------------------------------------------------------------
+
+
 def build_context(data: dict) -> dict:
+    """Turn the raw data.json dict into the full set of {{ tags }} the
+    template expects, deriving any fields the JSON doesn't supply directly."""
     ctx = dict(data)
     ctx["client_first_name"] = data["client_name"].split()[0]
     return ctx
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -248,7 +288,7 @@ def main() -> None:
     parser.add_argument("--data", default="data.json")
     parser.add_argument(
         "--renderer",
-        choices=["pages", "weasyprint", "word", "libreoffice"],
+        choices=["pages", "word", "libreoffice"],
         default="pages",
     )
     args = parser.parse_args()
@@ -258,15 +298,19 @@ def main() -> None:
     log.info("Data file : %s", ROOT / args.data)
     log.info("Renderer  : %s", args.renderer)
 
+    ensure_fonts_installed()
+
     if not TEMPLATE.exists():
         sys.exit(f"ERROR: template not found at {TEMPLATE}")
     data_path = ROOT / args.data
     if not data_path.exists():
         sys.exit(f"ERROR: data file not found at {data_path}")
 
+    # ---- 1. Load data + patch the template's raw XML ----
     data = json.loads(data_path.read_text())
     patched = patch_docx(TEMPLATE.read_bytes())
 
+    # ---- 2. Confirm the template actually has merge fields to fill ----
     doc = DocxTemplate(io.BytesIO(patched))
     tags = sorted(doc.get_undeclared_template_variables())
     log.info("Merge tags: %s", tags or "NONE")
@@ -284,6 +328,7 @@ def main() -> None:
     if missing:
         log.warning("Tags with no data (blank in output): %s", missing)
 
+    # ---- 3. Fill the tags in and save the editable .docx deliverable ----
     doc.render(ctx)
     filled_docx = OUTPUT_DIR / "engagement_letter_filled.docx"
     doc.save(filled_docx)
@@ -295,12 +340,11 @@ def main() -> None:
     else:
         log.error("VERIFY FAILED: '%s' not found", data["client_name"])
 
+    # ---- 4. Render the .docx to the PDF deliverable ----
     if args.renderer == "word":
         render_with_word(filled_docx, OUTPUT_DIR)
     elif args.renderer == "libreoffice":
         render_with_libreoffice(filled_docx, OUTPUT_DIR)
-    elif args.renderer == "weasyprint":
-        render_with_weasyprint(ctx, OUTPUT_DIR)
     else:
         render_with_pages(filled_docx, OUTPUT_DIR)
 
